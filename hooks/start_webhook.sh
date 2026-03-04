@@ -30,14 +30,22 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Check dependencies ---
-for cmd in python3 ngrok gh; do
+for cmd in ngrok gh uv; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd is not installed." >&2
         exit 1
     fi
 done
 
-python3 -c "import flask" 2>/dev/null || { echo "ERROR: flask not installed. Run: pip3 install flask" >&2; exit 1; }
+# --- Set up virtualenv ---
+VENV_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtualenv at $VENV_DIR..."
+    uv venv "$VENV_DIR"
+fi
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+uv pip install -q -r "$(cd "$SCRIPT_DIR/.." && pwd)/requirements.txt"
 
 # --- Start Flask server ---
 echo "Starting Flask server on port $PORT..."
@@ -92,7 +100,7 @@ HOOK_RESPONSE=$(gh api "repos/$REPO/hooks" \
     -f "config[content_type]=json" \
     -f "config[secret]=$WEBHOOK_SECRET" \
     -f "events[]=pull_request" \
-    -f "active=true")
+    -F "active=true")
 
 HOOK_ID=$(echo "$HOOK_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "  Webhook created (ID: $HOOK_ID)"

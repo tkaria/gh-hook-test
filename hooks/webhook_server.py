@@ -9,7 +9,10 @@ import re
 import subprocess
 import sys
 
+from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, request
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from review_agent import (
     FORBIDDEN_PATTERNS,
@@ -19,6 +22,11 @@ from review_agent import (
     scan_text_for_quality,
     scan_text_for_secrets,
 )
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
 app = Flask(__name__)
 
@@ -81,6 +89,55 @@ def parse_diff(diff_text):
     return files
 
 
+# --- Claude review ---
+
+CLAUDE_SYSTEM_PROMPT = """\
+You are a senior code reviewer. You receive a unified diff from a GitHub pull request.
+Analyze the changes and provide a concise review covering:
+- Bugs or logic errors
+- Security vulnerabilities
+- Style or readability issues
+- Suggestions for improvement
+
+Format your response as:
+VERDICT: APPROVE | COMMENT | REQUEST_CHANGES
+Then a blank line, then your comments. Keep it concise and actionable.\
+"""
+
+
+def claude_review(diff_text, pr_number, repo):
+    """Send the PR diff to Claude for semantic code review.
+
+    Returns the review text, or None if the call fails.
+    """
+    if anthropic is None:
+        print(color("  Claude review skipped: anthropic package not installed", YELLOW))
+        return None
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print(color("  Claude review skipped: ANTHROPIC_API_KEY not set", YELLOW))
+        return None
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=CLAUDE_SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Review this PR diff (PR #{pr_number} on {repo}):\n\n```diff\n{diff_text}\n```",
+                }
+            ],
+        )
+        return message.content[0].text
+    except Exception as e:
+        print(color(f"  Claude review failed: {e}", YELLOW))
+        return None
+
+
 # --- PR review logic ---
 
 def review_pr(pr_number, repo):
@@ -135,6 +192,17 @@ def review_pr(pr_number, repo):
     if not blockers and not warnings:
         print(color("\n  All checks passed!", GREEN + BOLD))
 
+    # --- Claude semantic review ---
+    print(color(f"\n  Running Claude code review...", BOLD))
+    claude_result = claude_review(diff_text, pr_number, repo)
+    if claude_result:
+        print(color(f"\n  {'─'*50}", BOLD))
+        print(color("  Claude Review:", BOLD))
+        print(color(f"  {'─'*50}", BOLD))
+        for line in claude_result.splitlines():
+            print(f"  {line}")
+        print(color(f"  {'─'*50}", BOLD))
+
     # --- Build review body ---
     body_lines = ["## Automated Review Agent\n"]
 
@@ -155,7 +223,7 @@ def review_pr(pr_number, repo):
 
     body = "\n".join(body_lines)
 
-    # --- Post review ---
+    # --- Review verdict ---
     if blockers:
         review_event = "REQUEST_CHANGES"
     elif warnings:
@@ -163,17 +231,8 @@ def review_pr(pr_number, repo):
     else:
         review_event = "APPROVE"
 
-    print(f"\n  Posting review: {review_event}")
-
-    result = subprocess.run(
-        ["gh", "pr", "review", str(pr_number), "--repo", repo,
-         f"--{review_event.lower().replace('_', '-')}", "--body", body],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(color(f"  ERROR posting review: {result.stderr}", RED))
-    else:
-        print(color("  Review posted successfully.", GREEN))
+    print(color(f"\n  Review verdict: {review_event}", BOLD))
+    print(color(f"\n{body}", YELLOW if warnings else (RED if blockers else GREEN)))
 
 
 # --- Routes ---
